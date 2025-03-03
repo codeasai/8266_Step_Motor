@@ -1,10 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <Stepper.h>
-
-// ข้อมูล WiFi ตามที่คุณให้มา
-const char* ssid = "2.4G_xProi";
-const char* password = "zaqwsxcde";
+#include "credentials.h"  // เพิ่ม include สำหรับไฟล์ credentials
 
 // กำหนดค่าสเต็ปปเปอร์มอเตอร์ 28BYJ-48
 // จำนวนสเต็ปต่อรอบของ 28BYJ-48 กับ ULN2003
