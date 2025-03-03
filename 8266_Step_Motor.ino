@@ -1,7 +1,9 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <Stepper.h>
-#include "credentials.h"  // เพิ่ม include สำหรับไฟล์ credentials
+#include <EEPROM.h>
+#include "credentials.h"
+#include "28BYJ48.h"
 
 // กำหนดค่าสเต็ปปเปอร์มอเตอร์ 28BYJ-48
 // จำนวนสเต็ปต่อรอบของ 28BYJ-48 กับ ULN2003
@@ -31,17 +33,8 @@
 #define IN3 D3
 #define IN4 D4
 
-// ความเร็วมอเตอร์ปัจจุบัน (RPM)
-int motorSpeed = 10;
-// ทิศทาง (1 = ตามเข็ม, -1 = ทวนเข็ม)
-int motorDirection = 1;
-// จำนวนสเต็ปที่จะหมุน
-int stepsToMove = 2048;
-// สถานะการทำงาน (0 = หยุด, 1 = กำลังทำงาน)
-int motorRunning = 0;
-
-// สร้าง Object สำหรับควบคุมสเต็ปเปอร์มอเตอร์
-Stepper stepper(STEPS_PER_REVOLUTION, IN1, IN3, IN2, IN4);
+// สร้าง object สำหรับควบคุมมอเตอร์
+StepperMotor motor(IN1, IN2, IN3, IN4);
 
 // สร้าง WebServer ที่พอร์ต 80
 ESP8266WebServer server(80);
@@ -58,8 +51,49 @@ const char index_html[] PROGMEM = R"rawliteral(
     h2 {font-size: 2.4rem;}
     p {font-size: 1.6rem;}
     body {max-width: 600px; margin:0px auto; padding: 20px;}
+    .clock-face {
+      width: 300px;
+      height: 300px;
+      border: 10px solid #333;
+      border-radius: 50%;
+      margin: 20px auto;
+      position: relative;
+      background: #fff;
+    }
+    .hour-button {
+      position: absolute;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      cursor: pointer;
+      font-size: 18px;
+      transform-origin: center;
+    }
+    .hour-button:hover {
+      background: #45a049;
+    }
+    .hour-button.active {
+      background: #ff9800;
+    }
+    .control-group {
+      margin: 20px 0;
+      padding: 15px;
+      border: 1px solid #ddd;
+      border-radius: 10px;
+      background-color: #f9f9f9;
+    }
     .slider {width: 100%; height: 50px;}
-    .output {font-size: 2rem; font-weight: bold; margin: 20px 0;}
+    .status {
+      padding: 10px;
+      margin-top: 20px;
+      border-radius: 5px;
+      font-weight: bold;
+    }
+    .status-stopped { background-color: #ffcccc; color: #f44336; }
+    .status-running { background-color: #ccffcc; color: #4CAF50; }
     .button {
       background-color: #4CAF50;
       border: none;
@@ -71,198 +105,206 @@ const char index_html[] PROGMEM = R"rawliteral(
       cursor: pointer;
       border-radius: 6px;
     }
-    .button-stop {background-color: #f44336;}
-    .button-cw {background-color: #2196F3;}
-    .button-ccw {background-color: #ff9800;}
-    .control-group {
-      margin: 20px 0;
-      padding: 15px;
-      border: 1px solid #ddd;
-      border-radius: 10px;
-      background-color: #f9f9f9;
+    .button-stop {
+      background-color: #f44336;
     }
-    .speed-display {
-      font-size: 2.5rem;
-      font-weight: bold;
-      margin: 20px 0;
-      color: #2196F3;
+    .direction-button {
+        background-color: #2196F3;
+        opacity: 0.6;
+        padding: 10px 20px;
     }
-    .direction-display {
-      font-size: 1.5rem;
-      margin: 10px 0;
-      color: #ff9800;
+    .direction-button.active {
+        opacity: 1;
     }
-    .steps-input {
-      width: 100px;
-      padding: 10px;
-      font-size: 16px;
-      border-radius: 5px;
-      border: 1px solid #ddd;
-      text-align: center;
+    .speed-button {
+        background-color: #2196F3;
+        opacity: 0.6;
+        padding: 10px 20px;
+        margin: 0 5px;
     }
-    .status {
-      padding: 10px;
-      margin-top: 20px;
-      border-radius: 5px;
-      font-weight: bold;
+    .speed-button.active {
+        opacity: 1;
     }
-    .status-stopped {
-      background-color: #ffcccc;
-      color: #f44336;
-    }
-    .status-running {
-      background-color: #ccffcc;
-      color: #4CAF50;
+    .button-reset {
+        background-color: #ff9800;  // สีส้ม
     }
   </style>
 </head>
 <body>
   <h2>ESP8266 Stepper Motor Control</h2>
-  <h3>28BYJ-48 with ULN2003</h3>
+  <h3>28BYJ-48 Clock Position Control</h3>
   
-  <div class="speed-display">
-    <span id="speedValue">10</span> RPM
-  </div>
-  
-  <div class="direction-display">
-    Direction: <span id="directionValue">Clockwise</span>
+  <div class="clock-face" id="clockFace">
+    <!-- ปุ่มจะถูกสร้างด้วย JavaScript -->
   </div>
   
   <div class="control-group">
-    <p>Speed (RPM)</p>
-    <input type="range" min="1" max="20" value="10" class="slider" id="speedSlider">
+    <p>Motor Speed:</p>
+    <button class="button speed-button" id="lowSpeed" onclick="setSpeed('low')">Low Speed</button>
+    <button class="button speed-button" id="highSpeed" onclick="setSpeed('high')">High Speed</button>
   </div>
-  
+
+  <div class="status" id="statusDiv">
+    <p>Current Position: <span id="currentHour">12</span></p>
+    <p>Target Position: <span id="targetHour">12</span></p>
+  </div>
+
   <div class="control-group">
-    <p>Steps to move</p>
-    <input type="number" min="1" max="4096" value="2048" class="steps-input" id="stepsInput">
-    <p><small>2048 steps = 1 complete revolution</small></p>
+    <p>Rotation Direction:</p>
+    <button class="button direction-button" id="autoButton" onclick="setDirection('auto')">Auto</button>
+    <button class="button direction-button" id="cwButton" onclick="setDirection('cw')">Clockwise</button>
+    <button class="button direction-button" id="ccwButton" onclick="setDirection('ccw')">Counter-Clockwise</button>
   </div>
-  
+
   <div class="control-group">
-    <p>Direction</p>
-    <button class="button button-cw" id="cwButton" onclick="setDirection(1)">Clockwise</button>
-    <button class="button button-ccw" id="ccwButton" onclick="setDirection(-1)">Counter-Clockwise</button>
-  </div>
-  
-  <div class="control-group">
-    <p>Control</p>
-    <button class="button" id="startButton" onclick="startMotor()">START</button>
-    <button class="button button-stop" id="stopButton" onclick="stopMotor()">STOP</button>
-  </div>
-  
-  <div id="statusDiv" class="status status-stopped">
-    Motor Status: <span id="statusText">Stopped</span>
+    <button class="button" id="startButton" onclick="startMotor()">MOVE TO TARGET</button>
+    <button class="button button-reset" id="resetButton" onclick="resetMotor()">RESET</button>
   </div>
 
   <script>
-    var speedSlider = document.getElementById("speedSlider");
-    var speedValue = document.getElementById("speedValue");
-    var directionValue = document.getElementById("directionValue");
-    var stepsInput = document.getElementById("stepsInput");
-    var statusText = document.getElementById("statusText");
-    var statusDiv = document.getElementById("statusDiv");
-    var cwButton = document.getElementById("cwButton");
-    var ccwButton = document.getElementById("ccwButton");
-    
-    // อัพเดทความเร็ว
-    speedSlider.oninput = function() {
-      speedValue.innerHTML = this.value;
-      updateMotorSpeed(this.value);
-    }
-    
-    // อัพเดทจำนวนสเต็ป
-    stepsInput.onchange = function() {
-      updateStepsToMove(this.value);
-    }
-    
-    // อัพเดทความเร็วมอเตอร์
-    function updateMotorSpeed(speed) {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/speed?value=" + speed, true);
-      xhr.send();
-    }
-    
-    // อัพเดทจำนวนสเต็ปที่จะหมุน
-    function updateStepsToMove(steps) {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/steps?value=" + steps, true);
-      xhr.send();
-    }
-    
-    // ตั้งค่าทิศทาง
-    function setDirection(direction) {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/direction?value=" + direction, true);
-      xhr.send();
+    // สร้างปุ่มบนหน้าปัดนาฬิกา
+    const clockFace = document.getElementById('clockFace');
+    for (let i = 1; i <= 12; i++) {
+      const button = document.createElement('button');
+      button.textContent = i;
+      button.className = 'hour-button';
       
-      if (direction == 1) {
-        directionValue.innerHTML = "Clockwise";
-        cwButton.style.opacity = "1";
-        ccwButton.style.opacity = "0.6";
-      } else {
-        directionValue.innerHTML = "Counter-Clockwise";
-        ccwButton.style.opacity = "1";
-        cwButton.style.opacity = "0.6";
-      }
+      // คำนวณตำแหน่งของปุ่ม
+      const angle = (i - 3) * 30 * Math.PI / 180; // เริ่มที่ 3 นาฬิกา
+      const radius = 120; // รัศมีของวงกลม
+      const left = 150 + radius * Math.cos(angle);
+      const top = 150 + radius * Math.sin(angle);
+      
+      button.style.left = left - 20 + 'px';  // ลบครึ่งความกว้างของปุ่ม
+      button.style.top = top - 20 + 'px';   // ลบครึ่งความสูงของปุ่ม
+      
+      button.onclick = () => moveToHour(i);
+      clockFace.appendChild(button);
     }
-    
-    // เริ่มหมุนมอเตอร์
+
+    let currentSpeed = 'low';  // เริ่มต้นที่ความเร็วต่ำ
+
+    function setSpeed(speed) {
+        currentSpeed = speed;
+        
+        // อัพเดทสถานะปุ่ม
+        document.getElementById('lowSpeed').classList.toggle('active', speed === 'low');
+        document.getElementById('highSpeed').classList.toggle('active', speed === 'high');
+
+        // ส่งค่าความเร็วไปยังบอร์ด (low = 5 RPM, high = 12 RPM)
+        const rpm = speed === 'low' ? 5 : 12;
+        fetch('/speed?value=' + rpm)
+            .then(response => response.text())
+            .catch(error => console.error('Error:', error));
+    }
+
+    // เริ่มต้นที่ความเร็วต่ำ
+    setSpeed('low');
+
+    function moveToHour(hour) {
+      // อัพเดท UI ทันทีเมื่อเลือกตำแหน่งเป้าหมาย
+      document.getElementById('targetHour').textContent = hour;
+      
+      fetch('/moveToHour?hour=' + hour)
+        .then(response => response.text())
+        .catch(error => console.error('Error:', error));
+    }
+
     function startMotor() {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/start", true);
-      xhr.send();
-      statusText.innerHTML = "Running";
-      statusDiv.className = "status status-running";
-    }
-    
-    // หยุดมอเตอร์
-    function stopMotor() {
-      var xhr = new XMLHttpRequest();
-      xhr.open("GET", "/stop", true);
-      xhr.send();
-      statusText.innerHTML = "Stopped";
-      statusDiv.className = "status status-stopped";
-    }
-    
-    // ดึงสถานะเริ่มต้น
-    window.onload = function() {
-      // ดึงค่าความเร็วปัจจุบัน
-      fetch('/status')
-        .then(response => response.json())
-        .then(data => {
-          speedSlider.value = data.speed;
-          speedValue.innerHTML = data.speed;
-          stepsInput.value = data.steps;
-          
-          if (data.direction == 1) {
-            directionValue.innerHTML = "Clockwise";
-            cwButton.style.opacity = "1";
-            ccwButton.style.opacity = "0.6";
-          } else {
-            directionValue.innerHTML = "Counter-Clockwise";
-            ccwButton.style.opacity = "1";
-            cwButton.style.opacity = "0.6";
-          }
-          
-          if (data.running == 1) {
-            statusText.innerHTML = "Running";
-            statusDiv.className = "status status-running";
-          } else {
-            statusText.innerHTML = "Stopped";
-            statusDiv.className = "status status-stopped";
-          }
+      const currentHour = parseInt(document.getElementById('currentHour').textContent);
+      const targetHour = parseInt(document.getElementById('targetHour').textContent);
+      
+      if (currentHour === targetHour) {
+        alert('Current position is same as target position!');
+        return;
+      }
+      
+      // เพิ่มการแสดงสถานะกำลังเคลื่อนที่
+      const statusDiv = document.getElementById('statusDiv');
+      statusDiv.className = 'status status-running';
+      
+      fetch('/start')
+        .then(response => response.text())
+        .then(() => {
+          // อัพเดทสถานะหลังจากเคลื่อนที่เสร็จ
+          setTimeout(() => {
+            fetch('/status')
+              .then(response => response.json())
+              .then(data => {
+                document.getElementById('currentHour').textContent = data.currentHour;
+                statusDiv.className = 'status status-stopped';
+              });
+          }, 1000);
         })
         .catch(error => console.error('Error:', error));
     }
+
+    function resetMotor() {
+        if (confirm('Are you sure you want to reset? Motor will move to position 12.')) {
+            // อัพเดท UI ทันที
+            document.getElementById('targetHour').textContent = '12';
+            const statusDiv = document.getElementById('statusDiv');
+            statusDiv.className = 'status status-running';
+            
+            fetch('/reset')
+                .then(response => response.text())
+                .then(() => {
+                    // อัพเดทสถานะหลังจากเคลื่อนที่เสร็จ
+                    setTimeout(() => {
+                        fetch('/status')
+                            .then(response => response.json())
+                            .then(data => {
+                                document.getElementById('currentHour').textContent = data.currentHour;
+                                statusDiv.className = 'status status-stopped';
+                            });
+                    }, 1000);
+                })
+                .catch(error => console.error('Error:', error));
+        }
+    }
+
+    // อัพเดทสถานะทุก 1 วินาที
+    setInterval(() => {
+      fetch('/status')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('currentHour').textContent = data.currentHour;
+          document.getElementById('targetHour').textContent = data.targetHour;
+          
+          const statusDiv = document.getElementById('statusDiv');
+          statusDiv.className = data.running ? 'status status-running' : 'status status-stopped';
+          
+          // อัพเดทปุ่มที่เป็นตำแหน่งปัจจุบัน
+          document.querySelectorAll('.hour-button').forEach(button => {
+            button.classList.toggle('active', 
+              parseInt(button.textContent) === data.currentHour);
+          });
+        })
+        .catch(error => console.error('Error:', error));
+    }, 1000);
+
+    let currentDirection = 'auto';
+
+    function setDirection(direction) {
+        currentDirection = direction;
+        
+        // อัพเดทสถานะปุ่ม
+        document.getElementById('autoButton').classList.toggle('active', direction === 'auto');
+        document.getElementById('cwButton').classList.toggle('active', direction === 'cw');
+        document.getElementById('ccwButton').classList.toggle('active', direction === 'ccw');
+
+        // ส่งคำสั่งไปยังบอร์ด
+        fetch('/direction?mode=' + direction)
+            .then(response => response.text())
+            .catch(error => console.error('Error:', error));
+    }
+
+    // เริ่มต้นให้ Auto เป็นค่าเริ่มต้น
+    setDirection('auto');
   </script>
 </body>
 </html>
 )rawliteral";
-
-// ตัวแปรสำหรับตรวจสอบเวลาในการหมุนมอเตอร์
-unsigned long previousMillis = 0;
-int stepsCompleted = 0;
 
 void setup() {
   // เริ่มการสื่อสาร Serial
@@ -280,7 +322,13 @@ void setup() {
   Serial.println(IN4);
 
   // ตั้งค่าความเร็วเริ่มต้นของมอเตอร์
-  stepper.setSpeed(motorSpeed);
+  motor.setSpeed(10);
+
+  // เริ่มต้น EEPROM
+  EEPROM.begin(512);
+  
+  // เริ่มต้นมอเตอร์และ home ไปที่ตำแหน่ง 0 องศา
+  motor.setup();
 
   // เชื่อมต่อ WiFi
   WiFi.begin(ssid, password);
@@ -296,11 +344,11 @@ void setup() {
   // กำหนด Route handlers
   server.on("/", handleRoot);
   server.on("/speed", handleSpeed);
-  server.on("/steps", handleSteps);
-  server.on("/direction", handleDirection);
-  server.on("/start", handleStart);
-  server.on("/stop", handleStop);
+  server.on("/moveToHour", handleMoveToHour);
   server.on("/status", handleStatus);
+  server.on("/start", handleStart);
+  server.on("/reset", handleReset);
+  server.on("/direction", handleDirection);
   
   server.onNotFound([]() {
     server.send(404, "text/plain", "404: Not found");
@@ -312,34 +360,8 @@ void setup() {
 }
 
 void loop() {
-  // จัดการคำขอจาก WebServer
-  server.handleClient();
-  
-  // ตรวจสอบว่าต้องหมุนมอเตอร์หรือไม่
-  if (motorRunning) {
-    unsigned long currentMillis = millis();
-    
-    // คำนวณระยะเวลาระหว่างการหมุนแต่ละสเต็ป
-    unsigned long stepInterval = (60L * 1000L) / (motorSpeed * STEPS_PER_REVOLUTION);
-    
-    if (currentMillis - previousMillis >= stepInterval) {
-      previousMillis = currentMillis;
-      
-      // หมุนมอเตอร์หนึ่งสเต็ป
-      stepper.step(motorDirection);
-      stepsCompleted++;
-      
-      // เมื่อหมุนครบตามจำนวนแล้ว ให้หยุด
-      if (stepsCompleted >= stepsToMove) {
-        stepsCompleted = 0;
-        motorRunning = 0;
-        Serial.println("Motion completed.");
-      }
-      
-      // ให้ตัว CPU ทำงานอื่นๆ ได้บ้าง
-      yield();
-    }
-  }
+    server.handleClient();
+    motor.update();
 }
 
 // ส่งหน้าเว็บหลัก
@@ -349,67 +371,76 @@ void handleRoot() {
 
 // จัดการคำขอปรับความเร็ว
 void handleSpeed() {
-  if (server.hasArg("value")) {
-    motorSpeed = server.arg("value").toInt();
-    stepper.setSpeed(motorSpeed);
-    Serial.print("Motor speed set to: ");
-    Serial.println(motorSpeed);
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(400, "text/plain", "Bad request");
-  }
+    if (server.hasArg("value")) {
+        int speed = server.arg("value").toInt();
+        // จำกัดความเร็วให้เป็นแค่ 5 หรือ 12 RPM เท่านั้น
+        if (speed != 5 && speed != 12) {
+            speed = 5;  // ถ้าค่าไม่ถูกต้อง ให้ใช้ความเร็วต่ำ
+        }
+        motor.setSpeed(speed);
+        Serial.print("Motor speed set to: ");
+        Serial.print(speed);
+        Serial.println(" RPM");
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad request");
+    }
 }
 
-// จัดการคำขอปรับจำนวนสเต็ป
-void handleSteps() {
-  if (server.hasArg("value")) {
-    stepsToMove = server.arg("value").toInt();
-    Serial.print("Steps to move set to: ");
-    Serial.println(stepsToMove);
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(400, "text/plain", "Bad request");
-  }
+// เพิ่ม handler สำหรับการเคลื่อนที่ไปยังตำแหน่งที่ต้องการ
+void handleMoveToHour() {
+    if (server.hasArg("hour")) {
+        int hour = server.arg("hour").toInt();
+        motor.moveToHour(hour);
+        Serial.print("Moving to hour position: ");
+        Serial.println(hour);
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad request");
+    }
 }
 
-// จัดการคำขอปรับทิศทาง
-void handleDirection() {
-  if (server.hasArg("value")) {
-    motorDirection = server.arg("value").toInt();
-    Serial.print("Motor direction set to: ");
-    Serial.println(motorDirection == 1 ? "Clockwise" : "Counter-Clockwise");
-    server.send(200, "text/plain", "OK");
-  } else {
-    server.send(400, "text/plain", "Bad request");
-  }
-}
-
-// จัดการคำขอเริ่มทำงาน
-void handleStart() {
-  if (!motorRunning) {
-    motorRunning = 1;
-    stepsCompleted = 0;
-    previousMillis = millis();
-    Serial.println("Starting motor rotation...");
-  }
-  server.send(200, "text/plain", "Started");
-}
-
-// จัดการคำขอหยุดทำงาน
-void handleStop() {
-  motorRunning = 0;
-  stepsCompleted = 0;
-  Serial.println("Stopping motor...");
-  server.send(200, "text/plain", "Stopped");
-}
-
-// จัดการคำขอดึงสถานะ
+// อัพเดท handleStatus
 void handleStatus() {
-  String json = "{";
-  json += "\"speed\":" + String(motorSpeed) + ",";
-  json += "\"direction\":" + String(motorDirection) + ",";
-  json += "\"steps\":" + String(stepsToMove) + ",";
-  json += "\"running\":" + String(motorRunning);
-  json += "}";
-  server.send(200, "application/json", json);
+    String json = "{";
+    json += "\"speed\":" + String(motor.getSpeed()) + ",";
+    json += "\"currentHour\":" + String(motor.getCurrentHour()) + ",";
+    json += "\"targetHour\":" + String(motor.getTargetHour()) + ",";
+    json += "\"running\":" + String(motor.getRunningStatus());
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+// เพิ่ม handler สำหรับ start/reset
+void handleStart() {
+    motor.moveToTarget();  // เปลี่ยนจาก start() เป็น moveToTarget()
+    Serial.println("Moving to target position...");
+    server.send(200, "text/plain", "Moving");
+}
+
+// เพิ่ม handler สำหรับ reset
+void handleReset() {
+    motor.resetToHome();
+    Serial.println("Resetting motor to 0 degrees (position 12)...");
+    server.send(200, "text/plain", "Resetting");
+}
+
+// เพิ่ม handler สำหรับการตั้งค่าทิศทาง
+void handleDirection() {
+    if (server.hasArg("mode")) {
+        String mode = server.arg("mode");
+        if (mode == "auto") {
+            motor.setRotationDirection(false, false);
+            Serial.println("Set direction: Auto");
+        } else if (mode == "cw") {
+            motor.setRotationDirection(true, false);
+            Serial.println("Set direction: Clockwise");
+        } else if (mode == "ccw") {
+            motor.setRotationDirection(false, true);
+            Serial.println("Set direction: Counter-Clockwise");
+        }
+        server.send(200, "text/plain", "OK");
+    } else {
+        server.send(400, "text/plain", "Bad request");
+    }
 }
